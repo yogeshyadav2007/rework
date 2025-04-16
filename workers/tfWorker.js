@@ -1,47 +1,56 @@
-// Initialize TensorFlow.js
-const tf = self.tf;
+class WorkerWrapper {
+  constructor() {
+    this.iframe = document.createElement('iframe');
+    this.iframe.src = chrome.runtime.getURL('sandbox/sandbox.html');
+    this.iframe.style.display = 'none';
+    document.body.appendChild(this.iframe);
+    
+    this.pendingResolves = new Map();
+    this.messageId = 0;
+    
+    window.addEventListener('message', this.handleMessage.bind(this));
+  }
 
-// Model loading flag
-let isModelLoading = false;
-let model;
-
-// Preprocessing function
-function preprocessText(text) {
-  // Simple feature extraction - replace with your actual preprocessing
-  const features = new Array(100).fill(0);
-  const words = text.toLowerCase().split(/\s+/);
-  words.forEach(word => {
-    if (word.length > 0) {
-      const index = word.length % 100;
-      features[index] += 1;
+  handleMessage(event) {
+    if (event.data.type === 'prediction' || event.data.type === 'error') {
+      const { id, prediction, error } = event.data;
+      const resolve = this.pendingResolves.get(id);
+      if (resolve) {
+        error ? reject(error) : resolve(prediction);
+        this.pendingResolves.delete(id);
+      }
     }
-  });
-  return features;
+  }
+
+  async predict(text) {
+    return new Promise((resolve, reject) => {
+      const id = this.messageId++;
+      this.pendingResolves.set(id, resolve);
+      this.iframe.contentWindow.postMessage({ 
+        type: 'predict',
+        text,
+        id
+      }, '*');
+      
+      // Timeout fallback
+      setTimeout(() => {
+        if (this.pendingResolves.has(id)) {
+          this.pendingResolves.delete(id);
+          reject(new Error('Prediction timeout'));
+        }
+      }, 10000);
+    });
+  }
 }
+
+const worker = new WorkerWrapper();
 
 self.onmessage = async (event) => {
   try {
-    // Load model if needed
-    if (!model && !isModelLoading) {
-      isModelLoading = true;
-      model = await tf.loadLayersModel(chrome.runtime.getURL('model.json'));
-      isModelLoading = false;
-    }
-
-    // Wait if model is still loading
-    while (isModelLoading) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-
-    // Preprocess and predict
-    const features = preprocessText(event.data.text);
-    const input = tf.tensor2d([features]);
-    const prediction = model.predict(input).dataSync()[0];
-    input.dispose();
-
-    self.postMessage(prediction);
+    const prediction = await worker.predict(event.data.text);
+    self.postMessage({ prediction });
   } catch (error) {
-    console.error('Prediction error:', error);
-    self.postMessage(0.5); // Neutral fallback
+    console.error('Worker error:', error);
+    self.postMessage({ prediction: 0.5 });
   }
 };
